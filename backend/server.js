@@ -952,6 +952,29 @@ app.get('/api/stream/:taskId', (req, res) => {
   });
 });
 
+// Diagnostic endpoint — shows env state without leaking secrets
+app.get('/api/diag', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    nodeEnv: process.env.NODE_ENV,
+    port: process.env.PORT,
+    keys: {
+      kimi: {
+        present: !!process.env.KIMI_CODE_API_KEY,
+        length: process.env.KIMI_CODE_API_KEY ? process.env.KIMI_CODE_API_KEY.length : 0,
+        prefix: process.env.KIMI_CODE_API_KEY ? process.env.KIMI_CODE_API_KEY.slice(0, 10) : null,
+      },
+      anthropic: {
+        present: !!process.env.ANTHROPIC_API_KEY,
+        length: process.env.ANTHROPIC_API_KEY ? process.env.ANTHROPIC_API_KEY.length : 0,
+        prefix: process.env.ANTHROPIC_API_KEY ? process.env.ANTHROPIC_API_KEY.slice(0, 10) : null,
+      },
+    },
+    envVarNames: Object.keys(process.env).filter(k => k.includes('KIMI') || k.includes('ANTHROPIC') || k.includes('API_KEY')),
+  });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
