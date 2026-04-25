@@ -65,6 +65,24 @@ const activeAgents = new Map();
 // SSE listeners: taskId -> Set of response objects
 const sseListeners = new Map();
 
+// Event buffer for SSE replay (prevents race condition where client connects after pipeline starts)
+const taskEventBuffers = new Map();
+const EVENT_BUFFER_LIMIT = 500;
+
+function bufferTaskEvent(taskId, event, data) {
+  if (!taskEventBuffers.has(taskId)) taskEventBuffers.set(taskId, []);
+  const buffer = taskEventBuffers.get(taskId);
+  buffer.push({ event, data, timestamp: new Date().toISOString() });
+  if (buffer.length > EVENT_BUFFER_LIMIT) buffer.shift();
+}
+
+function flushTaskEventBuffer(taskId, res) {
+  const buffer = taskEventBuffers.get(taskId) || [];
+  for (const msg of buffer) {
+    sendSSE(res, msg.event, msg.data);
+  }
+}
+
 function addSseListener(taskId, res) {
   if (!sseListeners.has(taskId)) sseListeners.set(taskId, new Set());
   sseListeners.get(taskId).add(res);
@@ -104,6 +122,7 @@ function broadcast(event, data) {
   // Also broadcast to SSE listeners if this event belongs to a task
   if (data && data.taskId) {
     broadcastToTask(data.taskId, event, data);
+    bufferTaskEvent(data.taskId, event, data);
   }
 }
 
@@ -911,6 +930,9 @@ app.get('/api/stream/:taskId', (req, res) => {
 
   // Send initial connected event
   sendSSE(res, 'connected', { message: 'Connected to AI Orchestrator', taskId });
+
+  // Replay any events that were broadcast before this client connected
+  flushTaskEventBuffer(taskId, res);
 
   addSseListener(taskId, res);
 
