@@ -4,6 +4,7 @@ const http = require('http');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
+const { finished } = require('stream');
 require('dotenv').config();
 
 const { MemoryManager } = require('./memory');
@@ -160,6 +161,11 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
   }
 
   let httpStatus = 0;
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => {
+    console.warn(`[${taskId}] ${model} stream aborted due to timeout (90s)`);
+    abortController.abort();
+  }, 90000);
 
   try {
     const response = await fetch(url, {
@@ -175,8 +181,10 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
         max_tokens: maxTokens,
         stream: true,
       }),
+      signal: abortController.signal,
     });
 
+    clearTimeout(timeout);
     httpStatus = response.status;
     console.log(`[${taskId}] ${model} stream — HTTP ${httpStatus}, maxTokens=${maxTokens}`);
 
@@ -186,37 +194,96 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
     }
 
     const reader = response.body;
+    if (!reader) {
+      throw new Error('Response body is null — possible empty stream from API');
+    }
+
     let buffer = '';
     let fullText = '';
     let hasReceivedData = false;
+    let currentData = '';
+    let streamDone = false;
 
     reader.on('data', (chunk) => {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
-      buffer = lines.pop();
+      buffer = lines.pop(); // keep incomplete line in buffer
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data:')) continue;
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr === '[DONE]') continue;
-        try {
-          const data = JSON.parse(dataStr);
-          const content = data.choices?.[0]?.delta?.content || '';
-          const reasoning = data.choices?.[0]?.delta?.reasoning_content || '';
-          const text = content || reasoning;
-          if (text) {
-            hasReceivedData = true;
-            fullText += text;
-            onChunk(text, fullText);
+        if (!trimmed) {
+          // Empty line triggers event dispatch
+          if (currentData) {
+            if (currentData === '[DONE]') {
+              streamDone = true;
+            } else {
+              try {
+                const data = JSON.parse(currentData);
+                // Handle in-stream errors from the API
+                if (data.error) {
+                  console.error(`[${taskId}] ${model} in-stream error:`, data.error.message || JSON.stringify(data.error));
+                  continue;
+                }
+                const content = data.choices?.[0]?.delta?.content || '';
+                const reasoning = data.choices?.[0]?.delta?.reasoning_content || '';
+                const text = content || reasoning;
+                if (text) {
+                  hasReceivedData = true;
+                  fullText += text;
+                  onChunk(text, fullText);
+                }
+              } catch (parseErr) {
+                console.warn(`[${taskId}] ${model} SSE parse error:`, parseErr.message, '| raw:', currentData.slice(0, 200));
+              }
+            }
+            currentData = '';
           }
-        } catch {
-          // ignore parse errors for malformed chunks
+          continue;
+        }
+
+        if (trimmed.startsWith('data:')) {
+          const dataStr = trimmed.slice(5).trim();
+          if (currentData) {
+            currentData += '\n' + dataStr;
+          } else {
+            currentData = dataStr;
+          }
+        } else if (currentData) {
+          // Continuation line for multi-line data values (defensive)
+          currentData += '\n' + trimmed;
         }
       }
     });
 
-    reader.on('end', () => {
+    finished(reader, (err) => {
+      if (streamDone) return; // already handled
+      if (err) {
+        console.error(`[${taskId}] ${model} stream finished with error:`, err.message);
+        onError(err.message);
+        return;
+      }
+      // Process any remaining data in buffer
+      if (buffer.trim()) {
+        const trimmed = buffer.trim();
+        if (trimmed.startsWith('data:')) {
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr && dataStr !== '[DONE]') {
+            try {
+              const data = JSON.parse(dataStr);
+              const content = data.choices?.[0]?.delta?.content || '';
+              const reasoning = data.choices?.[0]?.delta?.reasoning_content || '';
+              const text = content || reasoning;
+              if (text) {
+                hasReceivedData = true;
+                fullText += text;
+                onChunk(text, fullText);
+              }
+            } catch (parseErr) {
+              console.warn(`[${taskId}] ${model} final buffer parse error:`, parseErr.message);
+            }
+          }
+        }
+      }
       if (!hasReceivedData) {
         console.warn(`[${taskId}] ${model} stream ended with NO data (HTTP ${httpStatus}). Output may be empty.`);
       }
@@ -225,13 +292,15 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
       }
       onComplete(fullText);
     });
-
-    reader.on('error', (err) => {
-      onError(err.message);
-    });
   } catch (err) {
-    console.error(`[${taskId}] ${model} stream failed — HTTP ${httpStatus}:`, err.message);
-    onError(err.message);
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') {
+      console.error(`[${taskId}] ${model} stream aborted — timed out after 90s`);
+      onError('Request timed out after 90 seconds');
+    } else {
+      console.error(`[${taskId}] ${model} stream failed — HTTP ${httpStatus}:`, err.message);
+      onError(err.message);
+    }
   }
 }
 
@@ -273,12 +342,6 @@ function parseConfidence(text) {
   const match2 = text.match(/(\d+)\s*\/\s*10/);
   if (match2) return parseInt(match2[1], 10);
   return 5;
-}
-
-function toUserOnlyMessages(systemText, userText) {
-  return [
-    { role: 'user', content: `## Instructions\n${systemText}\n\n## Task\n${userText}` },
-  ];
 }
 
 // ─── Agent Runner ───
@@ -387,9 +450,7 @@ async function runStandardPipeline(taskId, task, mode, primary, secondary, plann
     ? 'You are a devil\'s advocate. Aggressively challenge the plan. Identify flaws, risks, missing edge cases, and unrealistic assumptions. Be brief but ruthless. End with "Confidence: X/10".'
     : 'You are a critical reviewer. Review the solution, point out flaws, missing considerations, and suggest improvements. Be concise. End with "Confidence: X/10".';
   const criticUser = `Task: ${task}\n\n${isPlanning ? 'Plan' : 'Solution'} to review:\n${currentSolution}\n\nProvide your critique and confidence score.`;
-  const criticMessages = secondary === 'kimi'
-    ? toUserOnlyMessages(criticSystem, criticUser)
-    : [{ role: 'system', content: criticSystem }, { role: 'user', content: criticUser }];
+  const criticMessages = [{ role: 'system', content: criticSystem }, { role: 'user', content: criticUser }];
 
   currentCritique = await runAgent(taskId, secondary, criticRole, secondary, criticMessages, TOKEN_CAP.critic, startTime, 2, contextBlock);
   confidence = parseConfidence(currentCritique);
@@ -406,9 +467,7 @@ async function runStandardPipeline(taskId, task, mode, primary, secondary, plann
     if (maxRounds >= 4) {
       const reviewSystem = 'You are a reviewer. Briefly assess the revised plan. End with "Confidence: X/10".';
       const reviewUser = `Task: ${task}\n\nRevised plan:\n${currentSolution}\n\nProvide brief review and confidence score.`;
-      const reviewMessages = secondary === 'kimi'
-        ? toUserOnlyMessages(reviewSystem, reviewUser)
-        : [{ role: 'system', content: reviewSystem }, { role: 'user', content: reviewUser }];
+      const reviewMessages = [{ role: 'system', content: reviewSystem }, { role: 'user', content: reviewUser }];
       currentCritique = await runAgent(taskId, secondary, 'reviewer', secondary, reviewMessages, TOKEN_CAP.critic, startTime, 4, contextBlock);
       confidence = parseConfidence(currentCritique);
       broadcast('confidence_update', { taskId, confidence, round: 4 });
@@ -425,9 +484,7 @@ async function runStandardPipeline(taskId, task, mode, primary, secondary, plann
 
     const finalCriticSystem = 'You are a critical reviewer. Review the revised solution. End with "Confidence: X/10".';
     const finalCriticUser = `Task: ${task}\n\nRevised solution:\n${currentSolution}\n\nProvide brief critique and confidence score.`;
-    const finalCriticMessages = secondary === 'kimi'
-      ? toUserOnlyMessages(finalCriticSystem, finalCriticUser)
-      : [{ role: 'system', content: finalCriticSystem }, { role: 'user', content: finalCriticUser }];
+    const finalCriticMessages = [{ role: 'system', content: finalCriticSystem }, { role: 'user', content: finalCriticUser }];
     currentCritique = await runAgent(taskId, secondary, 'critic', secondary, finalCriticMessages, TOKEN_CAP.critic, startTime, 4, contextBlock);
     confidence = parseConfidence(currentCritique);
     broadcast('confidence_update', { taskId, confidence, round: 4 });

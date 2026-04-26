@@ -1,0 +1,13 @@
+{
+  "name": "ai-dashboard-root",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "concurrently \"npm run start:backend\" \"npm run start:frontend\" --names \"BACKEND,FRONTEND\" --prefix-colors \"cyan,magenta\"",
+    "start:backend": "cd backend && npm.cmd start",
+    "start:frontend": "cd frontend && npm.cmd start",
+    "stop": "taskkill /F /IM node.exe"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
