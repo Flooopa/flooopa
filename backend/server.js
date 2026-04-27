@@ -25,10 +25,10 @@ const CLAUDE_BASE_URL = process.env.CLAUDE_BASE_URL || 'https://api.anthropic.co
 
 const TOKEN_CAP = {
   solver: 2000,
-  critic: 800,
+  critic: 400,
   synthesizer: 600,
   planner: 2000,
-  devil: 800,
+  devil: 400,
   compiler: 600,
   finalizer: 800,
 };
@@ -147,11 +147,37 @@ async function buildMemoryContext(taskId, currentTask) {
 
 function injectContext(messages, contextBlock) {
   if (!contextBlock) return messages;
-  // Insert context as a system message at the start, or prepend to first user message
-  // Using markdown format for token efficiency
-  const contextMsg = { role: 'system', content: `## Context\n\n${contextBlock}\n\n---\n` };
-  return [contextMsg, ...messages];
+
+  const contextPrefix = `## Project Context\n\n${contextBlock}\n\n---\n\n`;
+
+  // Find all system messages and combine them with context
+  const systemIndices = [];
+  let combinedSystem = contextPrefix;
+
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'system') {
+      systemIndices.push(i);
+      combinedSystem += messages[i].content + '\n\n';
+    }
+  }
+
+  if (systemIndices.length === 0) {
+    // No system message exists — prepend combined context
+    return [{ role: 'system', content: combinedSystem.trim() }, ...messages];
+  }
+
+  // Replace first system message with combined content, drop other system messages
+  const result = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (i === systemIndices[0]) {
+      result.push({ role: 'system', content: combinedSystem.trim() });
+    } else if (messages[i].role !== 'system') {
+      result.push(messages[i]);
+    }
+  }
+  return result;
 }
+
 
 // ─── Streaming Helpers ───
 
@@ -196,7 +222,20 @@ async function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onEr
     let fullText = '';
     let hasReceivedData = false;
     let currentData = '';
-    let streamDone = false;
+    let resolved = false;
+
+    const safeComplete = (text) => {
+      if (!resolved) {
+        resolved = true;
+        onComplete(text);
+      }
+    };
+    const safeError = (msg) => {
+      if (!resolved) {
+        resolved = true;
+        onError(msg);
+      }
+    };
 
     reader.on('data', (chunk) => {
       buffer += chunk.toString();
@@ -208,7 +247,7 @@ async function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onEr
         if (!trimmed) {
           if (currentData) {
             if (currentData === '[DONE]') {
-              streamDone = true;
+              safeComplete(fullText);
             } else {
               try {
                 const data = JSON.parse(currentData);
@@ -244,10 +283,10 @@ async function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onEr
     });
 
     finished(reader, (err) => {
-      if (streamDone) return;
+      if (resolved) return;
       if (err) {
         console.error(`[${taskId}] kimi stream finished with error:`, err.message);
-        onError(err.message);
+        safeError(err.message);
         return;
       }
       if (buffer.trim()) {
@@ -266,12 +305,15 @@ async function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onEr
                 onChunk(text, fullText);
               }
             } catch {}
+          } else if (dataStr === '[DONE]') {
+            safeComplete(fullText);
+            return;
           }
         }
       }
       if (!hasReceivedData) console.warn(`[${taskId}] kimi stream ended with NO data (HTTP ${httpStatus}).`);
       if (!fullText.trim()) console.warn(`[${taskId}] kimi EMPTY output (HTTP ${httpStatus}, maxTokens=${maxTokens}).`);
-      onComplete(fullText);
+      safeComplete(fullText);
     });
   } catch (err) {
     clearTimeout(timeout);
@@ -285,15 +327,23 @@ async function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onEr
   }
 }
 
+
 async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, onError) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) { onError('Claude API key not configured'); return; }
 
-  const systemMsg = messages.find((m) => m.role === 'system')?.content;
+  // Combine all system messages into one (Claude only accepts a single system string)
+  const systemMessages = messages.filter((m) => m.role === 'system');
+  const systemMsg = systemMessages.map((m) => m.content).join('\n\n');
   const chatMessages = messages.filter((m) => m.role !== 'system').map((m) => ({
     role: m.role,
     content: m.content,
   }));
+
+  if (chatMessages.length === 0) {
+    onError('No chat messages provided to Claude');
+    return;
+  }
 
   let httpStatus = 0;
   const abortController = new AbortController();
@@ -332,9 +382,21 @@ async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, on
     let buffer = '';
     let fullText = '';
     let hasReceivedData = false;
-    let currentEvent = '';
     let currentData = '';
-    let streamDone = false;
+    let resolved = false;
+
+    const safeComplete = (text) => {
+      if (!resolved) {
+        resolved = true;
+        onComplete(text);
+      }
+    };
+    const safeError = (msg) => {
+      if (!resolved) {
+        resolved = true;
+        onError(msg);
+      }
+    };
 
     reader.on('data', (chunk) => {
       buffer += chunk.toString();
@@ -345,34 +407,31 @@ async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, on
         const trimmed = line.trim();
         if (!trimmed) {
           if (currentData) {
-            if (currentData === '[DONE]') {
-              streamDone = true;
-            } else {
-              try {
-                const data = JSON.parse(currentData);
-                if (data.type === 'content_block_delta' && data.delta?.text) {
-                  hasReceivedData = true;
-                  fullText += data.delta.text;
-                  onChunk(data.delta.text, fullText);
-                } else if (data.type === 'content_block_start' && data.content_block?.text) {
-                  hasReceivedData = true;
-                  fullText += data.content_block.text;
-                  onChunk(data.content_block.text, fullText);
-                } else if (data.type === 'message_delta' && data.delta?.stop_reason === 'error') {
-                  console.error(`[${taskId}] claude in-stream error event:`, data);
-                }
-              } catch (parseErr) {
-                console.warn(`[${taskId}] claude SSE parse error:`, parseErr.message, '| raw:', currentData.slice(0, 200));
+            try {
+              const data = JSON.parse(currentData);
+              if (data.type === 'content_block_delta' && data.delta?.text) {
+                hasReceivedData = true;
+                fullText += data.delta.text;
+                onChunk(data.delta.text, fullText);
+              } else if (data.type === 'content_block_start' && data.content_block?.text) {
+                hasReceivedData = true;
+                fullText += data.content_block.text;
+                onChunk(data.content_block.text, fullText);
+              } else if (data.type === 'message_delta' && data.delta?.stop_reason === 'error') {
+                console.error(`[${taskId}] claude in-stream error event:`, data);
+                safeError('Claude reported an in-stream error');
+                return;
               }
+            } catch (parseErr) {
+              console.warn(`[${taskId}] claude SSE parse error:`, parseErr.message, '| raw:', currentData.slice(0, 200));
             }
-            currentEvent = '';
             currentData = '';
           }
           continue;
         }
 
         if (trimmed.startsWith('event:')) {
-          currentEvent = trimmed.slice(6).trim();
+          // Track event type if needed for debugging
         } else if (trimmed.startsWith('data:')) {
           const dataStr = trimmed.slice(5).trim();
           if (currentData) currentData += '\n' + dataStr;
@@ -384,10 +443,10 @@ async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, on
     });
 
     finished(reader, (err) => {
-      if (streamDone) return;
+      if (resolved) return;
       if (err) {
         console.error(`[${taskId}] claude stream finished with error:`, err.message);
-        onError(err.message);
+        safeError(err.message);
         return;
       }
       if (buffer.trim()) {
@@ -415,7 +474,7 @@ async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, on
       }
       if (!hasReceivedData) console.warn(`[${taskId}] claude stream ended with NO data (HTTP ${httpStatus}).`);
       if (!fullText.trim()) console.warn(`[${taskId}] claude EMPTY output (HTTP ${httpStatus}, maxTokens=${maxTokens}).`);
-      onComplete(fullText);
+      safeComplete(fullText);
     });
   } catch (err) {
     clearTimeout(timeout);
@@ -428,6 +487,7 @@ async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, on
     }
   }
 }
+
 
 // ─── Task Detection & Role Logic ───
 function detectTaskType(task) {
@@ -467,6 +527,34 @@ async function runAgent(taskId, agentName, role, modelKey, messages, maxTokens, 
 
   return new Promise((resolve) => {
     let output = '';
+    let resolved = false;
+
+    // Hard timeout guard: if stream callbacks never fire, force resolve
+    const hardTimeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        console.error(`[${taskId}] ${modelKey} (${role}) HARD TIMEOUT — forcing resolve after 120s`);
+        broadcast('error', {
+          taskId,
+          agent: modelKey,
+          role,
+          error: 'Agent hard timeout — did not complete within 120 seconds',
+          round,
+        });
+        if (activeAgents.has(taskId)) {
+          activeAgents.get(taskId)[modelKey].status = 'error';
+        }
+        resolve(output);
+      }
+    }, 120000);
+
+    const safeResolve = (value) => {
+      clearTimeout(hardTimeout);
+      if (!resolved) {
+        resolved = true;
+        resolve(value);
+      }
+    };
 
     broadcast('agent_start', {
       taskId,
@@ -518,7 +606,7 @@ async function runAgent(taskId, agentName, role, modelKey, messages, maxTokens, 
         duration: Date.now() - startTime,
         round,
       });
-      resolve(full);
+      safeResolve(full);
     };
 
     const onError = (err) => {
@@ -526,7 +614,7 @@ async function runAgent(taskId, agentName, role, modelKey, messages, maxTokens, 
         activeAgents.get(taskId)[modelKey].status = 'error';
       }
       broadcast('error', { taskId, agent: modelKey, role, error: err, round });
-      resolve('');
+      safeResolve('');
     };
 
     if (modelKey === 'kimi') {
@@ -537,6 +625,7 @@ async function runAgent(taskId, agentName, role, modelKey, messages, maxTokens, 
   });
 }
 
+
 // ─── Standard Pipeline ───
 async function runStandardPipeline(taskId, task, mode, primary, secondary, planningMode, requestedRounds, startTime) {
   const isPlanning = planningMode || mode === 'planning';
@@ -545,69 +634,85 @@ async function runStandardPipeline(taskId, task, mode, primary, secondary, plann
   let currentSolution = '';
   let currentCritique = '';
   let confidence = 5;
+  let roundNum = 0;
 
   // Build memory context
   const { block: contextBlock } = await buildMemoryContext(taskId, task);
 
-  // Round 1: Solver
+  // --- Round 1: Solver (primary) ---
+  roundNum++;
   const solverRole = isPlanning ? 'architect' : 'solver';
   const solverSystem = isPlanning
-    ? 'You are a senior software architect. Create a structured plan with: Objective, Stack, Steps, Constraints, Success Criteria. Be thorough.'
-    : 'You are an expert problem solver. Solve the given task thoroughly. Show reasoning and provide a complete solution.';
+    ? 'You are a senior software architect. Create a structured plan with: Objective, Stack, Steps, Constraints, Success Criteria. Be thorough and specific.'
+    : 'You are an expert coder and problem solver. Solve the given task thoroughly. Show your reasoning, provide complete, paste-ready code with clear file paths and placement instructions. Use surgical edits over full rewrites when possible.';
   const solverMessages = [
     { role: 'system', content: solverSystem },
-    { role: 'user', content: `Task: ${task}\n\nPlease ${isPlanning ? 'architect a structured plan' : 'solve this completely'}.` },
+    { role: 'user', content: `Task: ${task}\n\nPlease ${isPlanning ? 'architect a structured plan' : 'solve this completely with code'}.` },
   ];
 
-  currentSolution = await runAgent(taskId, primary, solverRole, primary, solverMessages, TOKEN_CAP.solver, startTime, 1, contextBlock);
+  currentSolution = await runAgent(taskId, primary, solverRole, primary, solverMessages, TOKEN_CAP.solver, startTime, roundNum, contextBlock);
 
-  // Round 2: Critic
+  // --- Round 2: Critic (secondary) ---
+  roundNum++;
   const criticRole = isPlanning ? 'devil' : 'critic';
   const criticSystem = isPlanning
-    ? 'You are a devil\'s advocate. Aggressively challenge the plan. Identify flaws, risks, missing edge cases, and unrealistic assumptions. Be brief but ruthless. End with "Confidence: X/10".'
-    : 'You are a critical reviewer. Review the solution, point out flaws, missing considerations, and suggest improvements. Be concise. End with "Confidence: X/10".';
+    ? `You are a ruthless devil's advocate. Aggressively challenge the plan. Identify flaws, risks, missing edge cases, and unrealistic assumptions. Check against existing project systems for conflicts. Be brief but ruthless. End with "Confidence: X/10" where X is 1-10.`
+    : `You are a critical code reviewer. Review the solution for bugs, security issues, performance problems, and conflicts with existing project systems. Be concise and specific. End with "Confidence: X/10" where X is 1-10.`;
   const criticUser = `Task: ${task}\n\n${isPlanning ? 'Plan' : 'Solution'} to review:\n${currentSolution}\n\nProvide your critique and confidence score.`;
-  const criticMessages = [{ role: 'system', content: criticSystem }, { role: 'user', content: criticUser }];
+  const criticMessages = [
+    { role: 'system', content: criticSystem },
+    { role: 'user', content: criticUser },
+  ];
 
-  currentCritique = await runAgent(taskId, secondary, criticRole, secondary, criticMessages, TOKEN_CAP.critic, startTime, 2, contextBlock);
+  currentCritique = await runAgent(taskId, secondary, criticRole, secondary, criticMessages, TOKEN_CAP.critic, startTime, roundNum, contextBlock);
   confidence = parseConfidence(currentCritique);
-  broadcast('confidence_update', { taskId, confidence, round: 2 });
+  broadcast('confidence_update', { taskId, confidence, round: roundNum });
 
-  // Planning mode revision rounds
-  if (isPlanning && maxRounds >= 3) {
+  // --- Revision rounds ---
+  // Planning: always revise if maxRounds >= 3
+  // Coding: revise if confidence < 6 and we have rounds left
+  const needsRevision = isPlanning ? (maxRounds >= 3) : (confidence < 6 && maxRounds > 2);
+
+  if (needsRevision) {
+    roundNum++;
+    const revisionSystem = isPlanning
+      ? 'You are a senior software architect. Revise your plan addressing ALL critiques. Maintain structured format: Objective, Stack, Steps, Constraints, Success Criteria.'
+      : 'You are the primary coder. Revise your solution addressing every critique point. Provide complete, paste-ready code.';
     const revisionMessages = [
-      { role: 'system', content: 'You are a senior software architect. Revise your plan addressing all critiques. Maintain the structured format: Objective, Stack, Steps, Constraints, Success Criteria.' },
-      { role: 'user', content: `Task: ${task}\n\nOriginal plan:\n${currentSolution}\n\nCritiques:\n${currentCritique}\n\nPlease revise the plan.` },
+      { role: 'system', content: revisionSystem },
+      { role: 'user', content: `Task: ${task}\n\nYour original ${isPlanning ? 'plan' : 'solution'}:\n${currentSolution}\n\nCritiques to address:\n${currentCritique}\n\nPlease produce the revised ${isPlanning ? 'plan' : 'solution'}.` },
     ];
-    currentSolution = await runAgent(taskId, primary, 'reviser', primary, revisionMessages, TOKEN_CAP.planner, startTime, 3, contextBlock);
+    currentSolution = await runAgent(taskId, primary, 'reviser', primary, revisionMessages, TOKEN_CAP.solver, startTime, roundNum, contextBlock);
 
-    if (maxRounds >= 4) {
-      const reviewSystem = 'You are a reviewer. Briefly assess the revised plan. End with "Confidence: X/10".';
-      const reviewUser = `Task: ${task}\n\nRevised plan:\n${currentSolution}\n\nProvide brief review and confidence score.`;
-      const reviewMessages = [{ role: 'system', content: reviewSystem }, { role: 'user', content: reviewUser }];
-      currentCritique = await runAgent(taskId, secondary, 'reviewer', secondary, reviewMessages, TOKEN_CAP.critic, startTime, 4, contextBlock);
+    // Second critique after revision
+    if (maxRounds >= 4 || isPlanning) {
+      roundNum++;
+      const reviewSystem = isPlanning
+        ? 'You are a reviewer. Assess the revised plan for completeness. End with "Confidence: X/10".'
+        : 'You are a critical reviewer. Review the revised solution. End with "Confidence: X/10".';
+      const reviewUser = `Task: ${task}\n\nRevised ${isPlanning ? 'plan' : 'solution'}:\n${currentSolution}\n\nProvide brief review and confidence score.`;
+      const reviewMessages = [
+        { role: 'system', content: reviewSystem },
+        { role: 'user', content: reviewUser },
+      ];
+      currentCritique = await runAgent(taskId, secondary, 'reviewer', secondary, reviewMessages, TOKEN_CAP.critic, startTime, roundNum, contextBlock);
       confidence = parseConfidence(currentCritique);
-      broadcast('confidence_update', { taskId, confidence, round: 4 });
+      broadcast('confidence_update', { taskId, confidence, round: roundNum });
     }
   }
 
-  // Smart escalation
-  if (!isPlanning && confidence < 6 && maxRounds > 2) {
-    const revisionMessages = [
-      { role: 'system', content: 'You are the primary solver. Revise your solution addressing the critique.' },
-      { role: 'user', content: `Task: ${task}\n\nYour original solution:\n${currentSolution}\n\nCritique:\n${currentCritique}\n\nPlease revise the solution.` },
+  // Planning mode: additional polish round if maxRounds >= 5
+  if (isPlanning && maxRounds >= 5) {
+    roundNum++;
+    const polishSystem = 'You are a senior architect. Polish the plan into final structured markdown: Objective, Stack, Steps, Constraints, Success Criteria, Risks & Mitigations.';
+    const polishMessages = [
+      { role: 'system', content: polishSystem },
+      { role: 'user', content: `Task: ${task}\n\nPlan:\n${currentSolution}\n\nCritiques addressed:\n${currentCritique}\n\nProduce the final polished plan in structured markdown.` },
     ];
-    currentSolution = await runAgent(taskId, primary, 'reviser', primary, revisionMessages, TOKEN_CAP.solver, startTime, 3, contextBlock);
-
-    const finalCriticSystem = 'You are a critical reviewer. Review the revised solution. End with "Confidence: X/10".';
-    const finalCriticUser = `Task: ${task}\n\nRevised solution:\n${currentSolution}\n\nProvide brief critique and confidence score.`;
-    const finalCriticMessages = [{ role: 'system', content: finalCriticSystem }, { role: 'user', content: finalCriticUser }];
-    currentCritique = await runAgent(taskId, secondary, 'critic', secondary, finalCriticMessages, TOKEN_CAP.critic, startTime, 4, contextBlock);
-    confidence = parseConfidence(currentCritique);
-    broadcast('confidence_update', { taskId, confidence, round: 4 });
+    currentSolution = await runAgent(taskId, primary, 'finalizer', primary, polishMessages, TOKEN_CAP.planner, startTime, roundNum, contextBlock);
   }
 
-  // Skip synthesis if confidence > 8
+  // --- Skip synthesis if high confidence (non-planning only) ---
   if (!isPlanning && confidence > 8) {
     broadcast('pipeline_complete', {
       taskId,
@@ -621,21 +726,41 @@ async function runStandardPipeline(taskId, task, mode, primary, secondary, plann
     return currentSolution;
   }
 
-  // Synthesis
+  // --- Joint Synthesis: Both models produce synthesis, primary merges ---
+  roundNum++;
+  const synthesizerSystem = isPlanning
+    ? 'You are a synthesis expert. Combine the plan and critiques into one coherent, improved final plan. Use structured markdown format.'
+    : 'You are a synthesis expert. Combine the original solution and critiques into one coherent, improved final answer with complete, paste-ready code.';
+  const synthesizerUser = `Task: ${task}\n\nOriginal ${isPlanning ? 'plan' : 'solution'}:\n${currentSolution}\n\nCritiques:\n${currentCritique}\n\nSynthesize the final best ${isPlanning ? 'plan' : 'answer'}.`;
   const synthesizerMessages = [
-    { role: 'system', content: isPlanning
-      ? 'You are a synthesis expert. Combine the plan and critiques into one coherent, improved final plan. Use structured format: Objective, Stack, Steps, Constraints, Success Criteria. Be concise.'
-      : 'You are a synthesis expert. Combine the original solution and critiques into one coherent, improved final answer. Be concise.'
-    },
-    { role: 'user', content: `Task: ${task}\n\nOriginal ${isPlanning ? 'plan' : 'solution'}:\n${currentSolution}\n\nCritiques:\n${currentCritique}\n\nSynthesize the final best ${isPlanning ? 'plan' : 'answer'}.` },
+    { role: 'system', content: synthesizerSystem },
+    { role: 'user', content: synthesizerUser },
   ];
 
-  await runAgent(taskId, primary, 'synthesizer', primary, synthesizerMessages, TOKEN_CAP.synthesizer, startTime, maxRounds, contextBlock);
+  // Run synthesis on both models in parallel
+  const primarySynthPromise = runAgent(taskId, primary, 'synthesizer', primary, synthesizerMessages, TOKEN_CAP.synthesizer, startTime, roundNum, contextBlock);
+  const secondarySynthPromise = runAgent(taskId, secondary, 'synthesizer', secondary, synthesizerMessages, TOKEN_CAP.synthesizer, startTime, roundNum, contextBlock);
 
-  const finalOutput = activeAgents.get(taskId)[primary].output;
+  const primarySynth = await primarySynthPromise;
+  const secondarySynth = await secondarySynthPromise;
+
+  // If secondary produced something useful and different, have primary do a final merge
+  let finalOutput = primarySynth;
+  if (secondarySynth && secondarySynth.trim().length > 50 && secondarySynth !== primarySynth) {
+    roundNum++;
+    const mergeSystem = isPlanning
+      ? 'You are a final editor. Take two synthesized plans and produce the single best combined plan. Be concise and complete.'
+      : 'You are a final editor. Take two synthesized answers and produce the single best combined answer with complete, paste-ready code.';
+    const mergeUser = `Task: ${task}\n\nSynthesis A:\n${primarySynth}\n\nSynthesis B:\n${secondarySynth}\n\nProduce the definitive final output.`;
+    const mergeMessages = [
+      { role: 'system', content: mergeSystem },
+      { role: 'user', content: mergeUser },
+    ];
+    finalOutput = await runAgent(taskId, primary, 'final-merger', primary, mergeMessages, TOKEN_CAP.synthesizer, startTime, roundNum, contextBlock);
+  }
 
   // Log decision to project memory
-  if (isPlanning && finalOutput) {
+  if (finalOutput) {
     await localAgent.logSessionDecision(taskId, PROJECT_NAME, finalOutput.slice(0, 400));
   }
 
@@ -650,6 +775,7 @@ async function runStandardPipeline(taskId, task, mode, primary, secondary, plann
 
   return finalOutput;
 }
+
 
 // ─── Research Pipeline ───
 async function runResearchPipeline(taskId, task, primary, secondary, startTime) {
