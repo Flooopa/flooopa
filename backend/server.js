@@ -18,10 +18,10 @@ const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3001;
 const PROJECT_NAME = process.env.PROJECT_NAME || 'default';
-const KIMI_MODEL = 'kimi-for-coding';
-const CLAUDE_MODEL = 'claude-sonnet-4-5';
-const KIMI_BASE_URL = 'https://api.kimi.com/coding/v1/chat/completions';
-const CLAUDE_BASE_URL = 'https://api.anthropic.com/v1/chat/completions';
+const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-for-coding';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
+const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.kimi.com/coding/v1/chat/completions';
+const CLAUDE_BASE_URL = process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com/v1';
 
 const TOKEN_CAP = {
   solver: 2000,
@@ -153,30 +153,26 @@ function injectContext(messages, contextBlock) {
   return [contextMsg, ...messages];
 }
 
-// ─── Streaming Helper ───
-async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChunk, onComplete, onError, extraHeaders = {}) {
-  if (!apiKey) {
-    onError('API key not configured');
-    return;
-  }
+// ─── Streaming Helpers ───
+
+async function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onError) {
+  const apiKey = process.env.KIMI_CODE_API_KEY;
+  if (!apiKey) { onError('Kimi API key not configured'); return; }
 
   let httpStatus = 0;
   const abortController = new AbortController();
-  const timeout = setTimeout(() => {
-    console.warn(`[${taskId}] ${model} stream aborted due to timeout (90s)`);
-    abortController.abort();
-  }, 90000);
+  const timeout = setTimeout(() => { abortController.abort(); }, 90000);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(KIMI_BASE_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
-        ...extraHeaders,
+        'User-Agent': 'KimiCLI/1.5',
       },
       body: JSON.stringify({
-        model,
+        model: KIMI_MODEL,
         messages,
         max_tokens: maxTokens,
         stream: true,
@@ -186,17 +182,15 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
 
     clearTimeout(timeout);
     httpStatus = response.status;
-    console.log(`[${taskId}] ${model} stream — HTTP ${httpStatus}, maxTokens=${maxTokens}`);
+    console.log(`[${taskId}] kimi stream — HTTP ${httpStatus}, maxTokens=${maxTokens}`);
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`API error (${model}): ${response.status} ${text}`);
+      throw new Error(`API error (kimi): ${response.status} ${text}`);
     }
 
     const reader = response.body;
-    if (!reader) {
-      throw new Error('Response body is null — possible empty stream from API');
-    }
+    if (!reader) throw new Error('Response body is null');
 
     let buffer = '';
     let fullText = '';
@@ -207,21 +201,19 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
     reader.on('data', (chunk) => {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep incomplete line in buffer
+      buffer = lines.pop();
 
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) {
-          // Empty line triggers event dispatch
           if (currentData) {
             if (currentData === '[DONE]') {
               streamDone = true;
             } else {
               try {
                 const data = JSON.parse(currentData);
-                // Handle in-stream errors from the API
                 if (data.error) {
-                  console.error(`[${taskId}] ${model} in-stream error:`, data.error.message || JSON.stringify(data.error));
+                  console.error(`[${taskId}] kimi in-stream error:`, data.error.message || JSON.stringify(data.error));
                   continue;
                 }
                 const content = data.choices?.[0]?.delta?.content || '';
@@ -233,7 +225,7 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
                   onChunk(text, fullText);
                 }
               } catch (parseErr) {
-                console.warn(`[${taskId}] ${model} SSE parse error:`, parseErr.message, '| raw:', currentData.slice(0, 200));
+                console.warn(`[${taskId}] kimi SSE parse error:`, parseErr.message, '| raw:', currentData.slice(0, 200));
               }
             }
             currentData = '';
@@ -243,26 +235,21 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
 
         if (trimmed.startsWith('data:')) {
           const dataStr = trimmed.slice(5).trim();
-          if (currentData) {
-            currentData += '\n' + dataStr;
-          } else {
-            currentData = dataStr;
-          }
+          if (currentData) currentData += '\n' + dataStr;
+          else currentData = dataStr;
         } else if (currentData) {
-          // Continuation line for multi-line data values (defensive)
           currentData += '\n' + trimmed;
         }
       }
     });
 
     finished(reader, (err) => {
-      if (streamDone) return; // already handled
+      if (streamDone) return;
       if (err) {
-        console.error(`[${taskId}] ${model} stream finished with error:`, err.message);
+        console.error(`[${taskId}] kimi stream finished with error:`, err.message);
         onError(err.message);
         return;
       }
-      // Process any remaining data in buffer
       if (buffer.trim()) {
         const trimmed = buffer.trim();
         if (trimmed.startsWith('data:')) {
@@ -278,38 +265,168 @@ async function streamChat(taskId, url, apiKey, model, messages, maxTokens, onChu
                 fullText += text;
                 onChunk(text, fullText);
               }
-            } catch (parseErr) {
-              console.warn(`[${taskId}] ${model} final buffer parse error:`, parseErr.message);
-            }
+            } catch {}
           }
         }
       }
-      if (!hasReceivedData) {
-        console.warn(`[${taskId}] ${model} stream ended with NO data (HTTP ${httpStatus}). Output may be empty.`);
-      }
-      if (!fullText.trim()) {
-        console.warn(`[${taskId}] ${model} EMPTY output (HTTP ${httpStatus}, maxTokens=${maxTokens}).`);
-      }
+      if (!hasReceivedData) console.warn(`[${taskId}] kimi stream ended with NO data (HTTP ${httpStatus}).`);
+      if (!fullText.trim()) console.warn(`[${taskId}] kimi EMPTY output (HTTP ${httpStatus}, maxTokens=${maxTokens}).`);
       onComplete(fullText);
     });
   } catch (err) {
     clearTimeout(timeout);
     if (err.name === 'AbortError') {
-      console.error(`[${taskId}] ${model} stream aborted — timed out after 90s`);
+      console.error(`[${taskId}] kimi stream aborted — timed out after 90s`);
       onError('Request timed out after 90 seconds');
     } else {
-      console.error(`[${taskId}] ${model} stream failed — HTTP ${httpStatus}:`, err.message);
+      console.error(`[${taskId}] kimi stream failed — HTTP ${httpStatus}:`, err.message);
       onError(err.message);
     }
   }
 }
 
-function streamKimi(taskId, messages, maxTokens, onChunk, onComplete, onError) {
-  streamChat(taskId, KIMI_BASE_URL, process.env.KIMI_CODE_API_KEY, KIMI_MODEL, messages, maxTokens, onChunk, onComplete, onError, { 'User-Agent': 'KimiCLI/1.5' });
-}
+async function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, onError) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) { onError('Claude API key not configured'); return; }
 
-function streamClaude(taskId, messages, maxTokens, onChunk, onComplete, onError) {
-  streamChat(taskId, CLAUDE_BASE_URL, process.env.ANTHROPIC_API_KEY, CLAUDE_MODEL, messages, maxTokens, onChunk, onComplete, onError);
+  const systemMsg = messages.find((m) => m.role === 'system')?.content;
+  const chatMessages = messages.filter((m) => m.role !== 'system').map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
+
+  let httpStatus = 0;
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => { abortController.abort(); }, 90000);
+
+  try {
+    const response = await fetch(`${CLAUDE_BASE_URL}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: maxTokens,
+        ...(systemMsg ? { system: systemMsg } : {}),
+        messages: chatMessages,
+        stream: true,
+      }),
+      signal: abortController.signal,
+    });
+
+    clearTimeout(timeout);
+    httpStatus = response.status;
+    console.log(`[${taskId}] claude stream — HTTP ${httpStatus}, maxTokens=${maxTokens}`);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`API error (claude): ${response.status} ${text}`);
+    }
+
+    const reader = response.body;
+    if (!reader) throw new Error('Response body is null');
+
+    let buffer = '';
+    let fullText = '';
+    let hasReceivedData = false;
+    let currentEvent = '';
+    let currentData = '';
+    let streamDone = false;
+
+    reader.on('data', (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          if (currentData) {
+            if (currentData === '[DONE]') {
+              streamDone = true;
+            } else {
+              try {
+                const data = JSON.parse(currentData);
+                if (data.type === 'content_block_delta' && data.delta?.text) {
+                  hasReceivedData = true;
+                  fullText += data.delta.text;
+                  onChunk(data.delta.text, fullText);
+                } else if (data.type === 'content_block_start' && data.content_block?.text) {
+                  hasReceivedData = true;
+                  fullText += data.content_block.text;
+                  onChunk(data.content_block.text, fullText);
+                } else if (data.type === 'message_delta' && data.delta?.stop_reason === 'error') {
+                  console.error(`[${taskId}] claude in-stream error event:`, data);
+                }
+              } catch (parseErr) {
+                console.warn(`[${taskId}] claude SSE parse error:`, parseErr.message, '| raw:', currentData.slice(0, 200));
+              }
+            }
+            currentEvent = '';
+            currentData = '';
+          }
+          continue;
+        }
+
+        if (trimmed.startsWith('event:')) {
+          currentEvent = trimmed.slice(6).trim();
+        } else if (trimmed.startsWith('data:')) {
+          const dataStr = trimmed.slice(5).trim();
+          if (currentData) currentData += '\n' + dataStr;
+          else currentData = dataStr;
+        } else if (currentData) {
+          currentData += '\n' + trimmed;
+        }
+      }
+    });
+
+    finished(reader, (err) => {
+      if (streamDone) return;
+      if (err) {
+        console.error(`[${taskId}] claude stream finished with error:`, err.message);
+        onError(err.message);
+        return;
+      }
+      if (buffer.trim()) {
+        const lines = buffer.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr && dataStr !== '[DONE]') {
+              try {
+                const data = JSON.parse(dataStr);
+                if (data.type === 'content_block_delta' && data.delta?.text) {
+                  hasReceivedData = true;
+                  fullText += data.delta.text;
+                  onChunk(data.delta.text, fullText);
+                } else if (data.type === 'content_block_start' && data.content_block?.text) {
+                  hasReceivedData = true;
+                  fullText += data.content_block.text;
+                  onChunk(data.content_block.text, fullText);
+                }
+              } catch {}
+            }
+          }
+        }
+      }
+      if (!hasReceivedData) console.warn(`[${taskId}] claude stream ended with NO data (HTTP ${httpStatus}).`);
+      if (!fullText.trim()) console.warn(`[${taskId}] claude EMPTY output (HTTP ${httpStatus}, maxTokens=${maxTokens}).`);
+      onComplete(fullText);
+    });
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') {
+      console.error(`[${taskId}] claude stream aborted — timed out after 90s`);
+      onError('Request timed out after 90 seconds');
+    } else {
+      console.error(`[${taskId}] claude stream failed — HTTP ${httpStatus}:`, err.message);
+      onError(err.message);
+    }
+  }
 }
 
 // ─── Task Detection & Role Logic ───
