@@ -75,6 +75,13 @@ app.use((req, res, next) => {
 // Store active agents state
 const activeAgents = new Map();
 
+// Configurable local service URLs (set via ngrok or other tunnels)
+const localServiceUrls = {
+  ollama: process.env.OLLAMA_URL || null,
+  indexer: process.env.INDEXER_URL || null,
+  lastUpdated: null,
+};
+
 // Roblox index storage (populated by roblox-indexer service)
 const robloxIndex = {
   gameName: '',
@@ -1416,69 +1423,82 @@ app.get('/api/system-status', async (req, res) => {
     checks.claude = { status: 'disconnected', latencyMs: Date.now() - claudeStart, error: err.message, keyPresent: !!process.env.ANTHROPIC_API_KEY };
   }
 
-  // Ollama check (via indexer for rich model data)
+  // Ollama check (via indexer for rich model data, with ngrok support)
+  const indexerUrl = localServiceUrls.indexer;
   const ollamaStart = Date.now();
-  try {
-    const ollamaRes = await fetch('http://localhost:3002/ollama-status', { timeout: 5000 });
-    if (ollamaRes.ok) {
-      const data = await ollamaRes.json();
-      checks.ollama = {
-        status: data.available ? 'connected' : 'error',
-        latencyMs: Date.now() - ollamaStart,
-        url: data.url,
-        targetModel: data.targetModel,
-        targetInstalled: data.targetInstalled,
-        targetLoaded: data.targetLoaded,
-        installedModels: data.installedModels || [],
-        loadedModels: data.loadedModels || [],
-        modelCount: data.installedCount || 0,
-        loadedCount: data.loadedCount || 0,
-      };
-    } else {
-      checks.ollama = { status: 'error', latencyMs: Date.now() - ollamaStart, httpStatus: ollamaRes.status };
+  if (indexerUrl) {
+    try {
+      const ollamaRes = await fetch(`${indexerUrl}/ollama-status`, { timeout: 5000 });
+      if (ollamaRes.ok) {
+        const data = await ollamaRes.json();
+        checks.ollama = {
+          status: data.available ? 'connected' : 'error',
+          latencyMs: Date.now() - ollamaStart,
+          url: data.url,
+          targetModel: data.targetModel,
+          targetInstalled: data.targetInstalled,
+          targetLoaded: data.targetLoaded,
+          installedModels: data.installedModels || [],
+          loadedModels: data.loadedModels || [],
+          modelCount: data.installedCount || 0,
+          loadedCount: data.loadedCount || 0,
+        };
+      } else {
+        checks.ollama = { status: 'error', latencyMs: Date.now() - ollamaStart, httpStatus: ollamaRes.status };
+      }
+    } catch (err) {
+      checks.ollama = { status: 'disconnected', latencyMs: Date.now() - ollamaStart, error: err.message };
     }
-  } catch (err) {
-    checks.ollama = { status: 'disconnected', latencyMs: Date.now() - ollamaStart, error: err.message };
+  } else {
+    checks.ollama = { status: 'not_configured', latencyMs: 0, error: 'No indexer URL configured. Set via /api/config/local-services or ngrok.' };
   }
 
   // Local indexer check
   const indexerStart = Date.now();
-  try {
-    const indexerRes = await fetch('http://localhost:3002/health', { timeout: 3000 });
-    const indexerData = indexerRes.ok ? await indexerRes.json() : {};
-    checks.indexer = {
-      status: indexerRes.ok ? 'connected' : 'error',
-      latencyMs: Date.now() - indexerStart,
-      httpStatus: indexerRes.status,
-      ollamaAvailable: indexerData.ollama?.available,
-      mcpConnected: indexerData.mcp?.connected,
-    };
-  } catch (err) {
-    checks.indexer = { status: 'disconnected', latencyMs: Date.now() - indexerStart, error: err.message };
+  if (indexerUrl) {
+    try {
+      const indexerRes = await fetch(`${indexerUrl}/health`, { timeout: 3000 });
+      const indexerData = indexerRes.ok ? await indexerRes.json() : {};
+      checks.indexer = {
+        status: indexerRes.ok ? 'connected' : 'error',
+        latencyMs: Date.now() - indexerStart,
+        httpStatus: indexerRes.status,
+        ollamaAvailable: indexerData.ollama?.available,
+        mcpConnected: indexerData.mcp?.connected,
+      };
+    } catch (err) {
+      checks.indexer = { status: 'disconnected', latencyMs: Date.now() - indexerStart, error: err.message };
+    }
+  } else {
+    checks.indexer = { status: 'not_configured', latencyMs: 0, error: 'No indexer URL configured. Set via /api/config/local-services or ngrok.' };
   }
 
   // Roblox MCP check (via indexer)
   const mcpStart = Date.now();
-  try {
-    const mcpRes = await fetch('http://localhost:3002/mcp-status', { timeout: 3000 });
-    if (mcpRes.ok) {
-      const data = await mcpRes.json();
-      checks.mcp = {
-        status: data.connected ? 'connected' : 'disconnected',
-        latencyMs: Date.now() - mcpStart,
-        connectedAt: data.connectedAt,
-        disconnectedAt: data.disconnectedAt,
-        transport: data.transport,
-        command: data.command,
-        tools: data.tools || [],
-        toolCount: (data.tools || []).length,
-        error: data.error,
-      };
-    } else {
-      checks.mcp = { status: 'error', latencyMs: Date.now() - mcpStart, httpStatus: mcpRes.status };
+  if (indexerUrl) {
+    try {
+      const mcpRes = await fetch(`${indexerUrl}/mcp-status`, { timeout: 3000 });
+      if (mcpRes.ok) {
+        const data = await mcpRes.json();
+        checks.mcp = {
+          status: data.connected ? 'connected' : 'disconnected',
+          latencyMs: Date.now() - mcpStart,
+          connectedAt: data.connectedAt,
+          disconnectedAt: data.disconnectedAt,
+          transport: data.transport,
+          command: data.command,
+          tools: data.tools || [],
+          toolCount: (data.tools || []).length,
+          error: data.error,
+        };
+      } else {
+        checks.mcp = { status: 'error', latencyMs: Date.now() - mcpStart, httpStatus: mcpRes.status };
+      }
+    } catch (err) {
+      checks.mcp = { status: 'disconnected', latencyMs: Date.now() - mcpStart, error: err.message };
     }
-  } catch (err) {
-    checks.mcp = { status: 'disconnected', latencyMs: Date.now() - mcpStart, error: err.message };
+  } else {
+    checks.mcp = { status: 'not_configured', latencyMs: 0, error: 'No indexer URL configured. Set via /api/config/local-services or ngrok.' };
   }
 
   // Backend self-check
@@ -1585,6 +1605,28 @@ app.get('/api/roblox-index/relevant', (req, res) => {
 
   const top = scored.sort((a, b) => b.score - a.score).slice(0, 10);
   res.json({ task, count: top.length, results: top });
+});
+
+// ─── Local Service URL Config ───
+app.get('/api/config/local-services', (req, res) => {
+  res.json({
+    ollama: localServiceUrls.ollama,
+    indexer: localServiceUrls.indexer,
+    lastUpdated: localServiceUrls.lastUpdated,
+  });
+});
+
+app.post('/api/config/local-services', express.json(), (req, res) => {
+  const { ollama, indexer } = req.body;
+  if (ollama !== undefined) localServiceUrls.ollama = ollama || null;
+  if (indexer !== undefined) localServiceUrls.indexer = indexer || null;
+  localServiceUrls.lastUpdated = new Date().toISOString();
+  console.log(`[Config] Local services updated: ollama=${localServiceUrls.ollama}, indexer=${localServiceUrls.indexer}`);
+  res.json({
+    ollama: localServiceUrls.ollama,
+    indexer: localServiceUrls.indexer,
+    lastUpdated: localServiceUrls.lastUpdated,
+  });
 });
 
 // ─── Server Startup ───
