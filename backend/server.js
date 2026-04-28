@@ -1509,10 +1509,10 @@ app.get('/api/system-status', async (req, res) => {
     sessionKeys: memoryManager.sessionMemory.size,
   };
 
-  // Overall health
-  const allConnected = ['kimi', 'claude', 'ollama'].every((k) => checks[k]?.status === 'connected');
-  const partial = ['kimi', 'claude'].some((k) => checks[k]?.status === 'connected');
-  checks.overall = allConnected ? 'healthy' : partial ? 'degraded' : 'critical';
+  // Overall health (cloud services only — local services are optional)
+  const cloudConnected = ['kimi', 'claude'].every((k) => checks[k]?.status === 'connected');
+  const cloudPartial = ['kimi', 'claude'].some((k) => checks[k]?.status === 'connected');
+  checks.overall = cloudConnected ? 'healthy' : cloudPartial ? 'degraded' : 'critical';
 
   res.json(checks);
 });
