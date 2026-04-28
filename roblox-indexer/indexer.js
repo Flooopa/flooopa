@@ -10,6 +10,15 @@ class RobloxIndexer {
     this.ollama = new OllamaClient(config.ollama);
     this.mcpClient = null;
     this.transport = null;
+    this.mcpStatus = {
+      connected: false,
+      connectedAt: null,
+      disconnectedAt: null,
+      tools: [],
+      transport: config.mcp?.transport || 'stdio',
+      command: config.mcp?.command || '',
+      error: null,
+    };
     this.index = {
       gameName: config.gameName,
       indexedAt: null,
@@ -23,24 +32,46 @@ class RobloxIndexer {
     const mcpConfig = this.config.mcp;
     console.log('[Indexer] Connecting to MCP server...');
 
-    if (mcpConfig.transport === 'stdio') {
-      this.transport = new StdioClientTransport({
+    try {
+      if (mcpConfig.transport === 'stdio') {
+        this.transport = new StdioClientTransport({
+          command: mcpConfig.command,
+          args: mcpConfig.args,
+          env: { ...process.env, ...mcpConfig.env },
+        });
+      } else {
+        throw new Error(`Unsupported MCP transport: ${mcpConfig.transport}`);
+      }
+
+      this.mcpClient = new Client({ name: 'roblox-indexer', version: '1.0.0' });
+      await this.mcpClient.connect(this.transport);
+
+      // List available tools
+      const tools = await this.mcpClient.listTools();
+      this.mcpStatus = {
+        connected: true,
+        connectedAt: new Date().toISOString(),
+        disconnectedAt: null,
+        tools: tools.tools.map((t) => ({ name: t.name, description: t.description?.slice(0, 100) })),
+        transport: mcpConfig.transport,
         command: mcpConfig.command,
-        args: mcpConfig.args,
-        env: { ...process.env, ...mcpConfig.env },
-      });
-    } else {
-      throw new Error(`Unsupported MCP transport: ${mcpConfig.transport}`);
+        error: null,
+      };
+      console.log(`[Indexer] MCP connected. Available tools: ${tools.tools.map((t) => t.name).join(', ')}`);
+
+      return this.mcpClient;
+    } catch (err) {
+      this.mcpStatus = {
+        connected: false,
+        connectedAt: this.mcpStatus.connectedAt,
+        disconnectedAt: new Date().toISOString(),
+        tools: [],
+        transport: mcpConfig.transport,
+        command: mcpConfig.command,
+        error: err.message,
+      };
+      throw err;
     }
-
-    this.mcpClient = new Client({ name: 'roblox-indexer', version: '1.0.0' });
-    await this.mcpClient.connect(this.transport);
-
-    // List available tools
-    const tools = await this.mcpClient.listTools();
-    console.log(`[Indexer] MCP connected. Available tools: ${tools.tools.map((t) => t.name).join(', ')}`);
-
-    return this.mcpClient;
   }
 
   async disconnectMCP() {
@@ -48,6 +79,71 @@ class RobloxIndexer {
       await this.transport.close();
       this.transport = null;
       this.mcpClient = null;
+      this.mcpStatus.connected = false;
+      this.mcpStatus.disconnectedAt = new Date().toISOString();
+      this.mcpStatus.tools = [];
+    }
+  }
+
+  getMcpStatus() {
+    return { ...this.mcpStatus };
+  }
+
+  async getOllamaStatus() {
+    try {
+      const tagsRes = await fetch('http://localhost:11434/api/tags', { timeout: 5000 });
+      const tagsData = await tagsRes.json();
+      const installedModels = (tagsData.models || []).map((m) => ({
+        name: m.name,
+        model: m.model,
+        size: m.size,
+        modifiedAt: m.modified_at,
+        digest: m.digest,
+        parameterSize: m.details?.parameter_size,
+        quantization: m.details?.quantization_level,
+        family: m.details?.family,
+        format: m.details?.format,
+      }));
+
+      const psRes = await fetch('http://localhost:11434/api/ps', { timeout: 5000 });
+      const psData = await psRes.json();
+      const loadedModels = (psData.models || []).map((m) => ({
+        name: m.name,
+        model: m.model,
+        size: m.size,
+        sizeVram: m.size_vram,
+        digest: m.digest,
+        expiresAt: m.expires_at,
+      }));
+
+      const targetModel = this.config.ollama.model;
+      const targetInstalled = installedModels.some((m) => m.name === targetModel);
+      const targetLoaded = loadedModels.some((m) => m.name === targetModel);
+
+      return {
+        available: true,
+        url: this.config.ollama.url || 'http://localhost:11434',
+        targetModel,
+        targetInstalled,
+        targetLoaded,
+        installedModels,
+        loadedModels,
+        installedCount: installedModels.length,
+        loadedCount: loadedModels.length,
+      };
+    } catch (err) {
+      return {
+        available: false,
+        url: this.config.ollama.url || 'http://localhost:11434',
+        targetModel: this.config.ollama.model,
+        targetInstalled: false,
+        targetLoaded: false,
+        installedModels: [],
+        loadedModels: [],
+        installedCount: 0,
+        loadedCount: 0,
+        error: err.message,
+      };
     }
   }
 

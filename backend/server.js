@@ -1416,18 +1416,23 @@ app.get('/api/system-status', async (req, res) => {
     checks.claude = { status: 'disconnected', latencyMs: Date.now() - claudeStart, error: err.message, keyPresent: !!process.env.ANTHROPIC_API_KEY };
   }
 
-  // Ollama check
+  // Ollama check (via indexer for rich model data)
   const ollamaStart = Date.now();
   try {
-    const ollamaRes = await fetch('http://localhost:11434/api/tags', { timeout: 3000 });
+    const ollamaRes = await fetch('http://localhost:3002/ollama-status', { timeout: 5000 });
     if (ollamaRes.ok) {
       const data = await ollamaRes.json();
-      const models = data.models?.map((m) => m.name) || [];
       checks.ollama = {
-        status: 'connected',
+        status: data.available ? 'connected' : 'error',
         latencyMs: Date.now() - ollamaStart,
-        models,
-        modelCount: models.length,
+        url: data.url,
+        targetModel: data.targetModel,
+        targetInstalled: data.targetInstalled,
+        targetLoaded: data.targetLoaded,
+        installedModels: data.installedModels || [],
+        loadedModels: data.loadedModels || [],
+        modelCount: data.installedCount || 0,
+        loadedCount: data.loadedCount || 0,
       };
     } else {
       checks.ollama = { status: 'error', latencyMs: Date.now() - ollamaStart, httpStatus: ollamaRes.status };
@@ -1440,10 +1445,13 @@ app.get('/api/system-status', async (req, res) => {
   const indexerStart = Date.now();
   try {
     const indexerRes = await fetch('http://localhost:3002/health', { timeout: 3000 });
+    const indexerData = indexerRes.ok ? await indexerRes.json() : {};
     checks.indexer = {
       status: indexerRes.ok ? 'connected' : 'error',
       latencyMs: Date.now() - indexerStart,
       httpStatus: indexerRes.status,
+      ollamaAvailable: indexerData.ollama?.available,
+      mcpConnected: indexerData.mcp?.connected,
     };
   } catch (err) {
     checks.indexer = { status: 'disconnected', latencyMs: Date.now() - indexerStart, error: err.message };
@@ -1452,17 +1460,22 @@ app.get('/api/system-status', async (req, res) => {
   // Roblox MCP check (via indexer)
   const mcpStart = Date.now();
   try {
-    const mcpRes = await fetch('http://localhost:3002/index', { timeout: 3000 });
+    const mcpRes = await fetch('http://localhost:3002/mcp-status', { timeout: 3000 });
     if (mcpRes.ok) {
       const data = await mcpRes.json();
       checks.mcp = {
-        status: data.scripts?.length > 0 ? 'connected' : 'idle',
+        status: data.connected ? 'connected' : 'disconnected',
         latencyMs: Date.now() - mcpStart,
-        scriptCount: data.scripts?.length || 0,
-        gameName: data.gameName || 'unknown',
+        connectedAt: data.connectedAt,
+        disconnectedAt: data.disconnectedAt,
+        transport: data.transport,
+        command: data.command,
+        tools: data.tools || [],
+        toolCount: (data.tools || []).length,
+        error: data.error,
       };
     } else {
-      checks.mcp = { status: 'error', latencyMs: Date.now() - mcpStart };
+      checks.mcp = { status: 'error', latencyMs: Date.now() - mcpStart, httpStatus: mcpRes.status };
     }
   } catch (err) {
     checks.mcp = { status: 'disconnected', latencyMs: Date.now() - mcpStart, error: err.message };

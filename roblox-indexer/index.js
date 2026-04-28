@@ -21,8 +21,33 @@ app.use(express.json({ limit: '50mb' }));
 const indexer = new RobloxIndexer(config);
 
 // ─── Health ───
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', game: config.gameName, scriptsIndexed: indexer.index.scripts.length });
+app.get('/health', async (req, res) => {
+  const ollamaStatus = await indexer.getOllamaStatus();
+  res.json({
+    status: 'ok',
+    game: config.gameName,
+    scriptsIndexed: indexer.index.scripts.length,
+    mcp: indexer.getMcpStatus(),
+    ollama: {
+      available: ollamaStatus.available,
+      targetModel: ollamaStatus.targetModel,
+      targetInstalled: ollamaStatus.targetInstalled,
+      targetLoaded: ollamaStatus.targetLoaded,
+      installedCount: ollamaStatus.installedCount,
+      loadedCount: ollamaStatus.loadedCount,
+    },
+  });
+});
+
+// ─── MCP Status ───
+app.get('/mcp-status', (req, res) => {
+  res.json(indexer.getMcpStatus());
+});
+
+// ─── Ollama Status ───
+app.get('/ollama-status', async (req, res) => {
+  const status = await indexer.getOllamaStatus();
+  res.json(status);
 });
 
 // ─── GET /index ───
