@@ -54,7 +54,6 @@ class MemoryManager {
         knownBugs: [],
         stack: '',
         lastUpdated: null,
-        // Roblox-specific
         gameName: '',
         serviceStructure: [],
         remoteNames: [],
@@ -97,70 +96,159 @@ class MemoryManager {
   }
 
   compressSession(taskId, fullLogs) {
-    // Simple compression: keep last 3 rounds of key decisions
     const summary = fullLogs.slice(-800);
     this.setSessionMemory(taskId, summary);
     return summary;
   }
 
-  /* ───── Context Block ───── */
-  async buildContextBlock(projectName, currentTask, fileChanges = [], todoCount = 0, progress = 0) {
+  /* ───── Markdown Context Block ───── */
+  async buildContextBlock(projectName, currentTask, fileChanges = [], todos = [], progress = 0, knowledgeBase = new Map(), options = {}) {
+    const maxTokens = options.maxTokens || 6000;
     const global = await this.getGlobalMemory();
     const project = await this.getProjectMemory(projectName);
     const session = this.getSessionMemory(projectName) || '';
 
-    const globalText = this._formatGlobal(global);
-    const projectText = this._formatProject(project);
-    const sessionText = session ? `Recent: ${session.slice(0, 300)}` : '';
-    const contextText = this._formatContext(project, currentTask, fileChanges, todoCount, progress);
+    const sections = [];
 
-    const parts = [];
-    if (globalText) parts.push(`GLOBAL|${globalText}`);
-    if (projectText) parts.push(`PROJECT|${projectText}`);
-    if (sessionText) parts.push(`SESSION|${sessionText}`);
-    if (contextText) parts.push(`CTX|${contextText}`);
+    // Helper: add section if content exists
+    const add = (priority, header, content) => {
+      const trimmed = content?.toString().trim();
+      if (trimmed && trimmed !== 'null' && trimmed !== 'undefined') {
+        sections.push({ priority, header, content: trimmed });
+      }
+    };
 
-    const block = parts.join('\n');
-    const tokens = this.estimateTokens(block);
-    return { block, tokens, parts: { global: globalText, project: projectText, session: sessionText, context: contextText } };
-  }
+    // P1: Current task (always included)
+    add(1, 'Current Task', currentTask);
 
-  _formatGlobal(g) {
-    const out = [];
-    if (g.codingStyle) out.push(`style:${g.codingStyle}`);
-    if (g.preferences?.length) out.push(`prefs:${g.preferences.slice(-3).join(',')}`);
-    if (g.activeSystems?.length) out.push(`sys:${g.activeSystems.slice(-3).join(',')}`);
-    if (g.alwaysInject) out.push(`inject:${g.alwaysInject.slice(0, 120)}`);
-    return out.join('|');
-  }
-
-  _formatProject(p) {
-    const out = [];
-    if (p.gameName) out.push(`game:${p.gameName}`);
-    if (p.stack) out.push(`lang:${p.stack}`);
-    if (p.decisions?.length) out.push(`decisions:${p.decisions.slice(-2).map((d) => d.text).join('; ').slice(0, 200)}`);
-    if (p.knownBugs?.length) out.push(`bugs:${p.knownBugs.slice(-2).map((b) => b.text).join('; ').slice(0, 150)}`);
-    if (p.remoteNames?.length) out.push(`remotes:${p.remoteNames.join(',')}`);
-    if (p.serviceStructure?.length) out.push(`svcs:${p.serviceStructure.slice(-3).join(',')}`);
-    return out.join('|');
-  }
-
-  _formatContext(project, task, fileChanges, todoCount, progress) {
-    const out = [];
-    if (project.name) out.push(`proj:${project.name}`);
-    if (task) out.push(`focus:${task.slice(0, 80)}`);
-    if (fileChanges.length) {
-      const latest = fileChanges[fileChanges.length - 1];
-      const ago = Math.round((Date.now() - latest.time) / 1000);
-      out.push(`last_change:${latest.file}(${ago}s ago)`);
+    // P2: Stack & tech
+    if (project.stack) {
+      add(2, 'Stack', project.stack);
     }
-    out.push(`todos_high:${todoCount}`);
-    out.push(`progress:${progress}%`);
-    return out.join('|');
+
+    // P3: Guidelines (coding style + preferences)
+    const guideParts = [];
+    if (global.codingStyle) guideParts.push(`**Style:** ${global.codingStyle}`);
+    if (global.preferences?.length) guideParts.push(`**Preferences:** ${global.preferences.join('; ')}`);
+    if (global.alwaysInject) guideParts.push(`**Always Remember:** ${global.alwaysInject}`);
+    if (project.codingStylePrefs?.length) guideParts.push(`**Project Style:** ${project.codingStylePrefs.join('; ')}`);
+    add(3, 'Guidelines', guideParts.join('\n'));
+
+    // P4: Architecture Decisions (full text, last 15)
+    if (project.decisions?.length) {
+      const decisions = project.decisions
+        .slice(-15)
+        .map((d) => `- ${d.text}`)
+        .join('\n');
+      add(4, 'Architecture Decisions', decisions);
+    }
+
+    // P5: Known Bugs (full text, last 10)
+    if (project.knownBugs?.length) {
+      const bugs = project.knownBugs
+        .slice(-10)
+        .map((b) => `- ${b.text}`)
+        .join('\n');
+      add(5, 'Known Bugs', bugs);
+    }
+
+    // P6: Systems (Roblox-specific)
+    const sysParts = [];
+    if (project.gameName) sysParts.push(`**Game:** ${project.gameName}`);
+    if (project.serviceStructure?.length) sysParts.push(`**Services:** ${project.serviceStructure.join(', ')}`);
+    if (project.remoteNames?.length) sysParts.push(`**Remotes:** ${project.remoteNames.join(', ')}`);
+    if (global.activeSystems?.length) sysParts.push(`**Active Systems:** ${global.activeSystems.join(', ')}`);
+    add(6, 'Systems', sysParts.join('\n'));
+
+    // P7: File Summaries from knowledgeBase (the key addition for conflict detection)
+    if (knowledgeBase.size > 0) {
+      const entries = Array.from(knowledgeBase.entries())
+        .slice(-20)
+        .map(([file, summary]) => `### \`${file}\`\n${summary}`)
+        .join('\n\n');
+      add(7, 'File Summaries', entries);
+    }
+
+    // P8: Recent file changes
+    if (fileChanges.length) {
+      const changes = fileChanges
+        .slice(-8)
+        .map((c) => {
+          const ago = Math.round((Date.now() - c.time) / 1000);
+          const unit = ago < 60 ? `${ago}s` : ago < 3600 ? `${Math.round(ago / 60)}m` : `${Math.round(ago / 3600)}h`;
+          return `- **\`${c.file}\`** — changed ${unit} ago`;
+        })
+        .join('\n');
+      add(8, 'Recent Changes', changes);
+    }
+
+    // P9: Open Tasks (todos/fixmes)
+    const openTodos = todos?.filter((t) => t.status !== 'resolved' && t.status !== 'done');
+    if (openTodos?.length) {
+      const highPriority = openTodos.filter((t) => t.priority === 'high' || t.type === 'FIXME');
+      const rest = openTodos.filter((t) => t.priority !== 'high' && t.type !== 'FIXME');
+      const todoList = [
+        ...highPriority.slice(-8).map((t) => `- [${t.type}] **${t.text}**${t.file ? ` (\`${t.file}\`)` : ''}`),
+        ...rest.slice(-5).map((t) => `- [${t.type}] ${t.text}${t.file ? ` (\`${t.file}\`)` : ''}`),
+      ].join('\n');
+      add(9, 'Open Tasks', todoList);
+    }
+
+    // P10: Progress
+    if (progress > 0) {
+      add(10, 'Progress', `Project file coverage: ${progress}%`);
+    }
+
+    // P11: Session context
+    if (session) {
+      add(11, 'Recent Session', session);
+    }
+
+    // Sort by priority
+    sections.sort((a, b) => a.priority - b.priority);
+
+    // Build full block
+    let block = sections.map((s) => `## ${s.header}\n${s.content}`).join('\n\n');
+    let tokens = this.estimateTokens(block);
+
+    // Intelligent truncation if over budget
+    if (tokens > maxTokens) {
+      const kept = [];
+      let currentTokens = 0;
+
+      for (const section of sections) {
+        const sectionText = `## ${section.header}\n${section.content}`;
+        const sectionTokens = this.estimateTokens(sectionText);
+
+        if (currentTokens + sectionTokens <= maxTokens * 0.85) {
+          kept.push(sectionText);
+          currentTokens += sectionTokens;
+        } else {
+          // Try a truncated placeholder
+          const truncated = `## ${section.header}\n*[Truncated — ${sectionTokens}t exceeds budget. See project memory endpoint for full details.]*`;
+          const truncTokens = this.estimateTokens(truncated);
+          if (currentTokens + truncTokens <= maxTokens) {
+            kept.push(truncated);
+            currentTokens += truncTokens;
+          }
+          break;
+        }
+      }
+
+      block = kept.join('\n\n');
+      tokens = this.estimateTokens(block);
+    }
+
+    return {
+      block,
+      tokens,
+      sections: sections.map((s) => ({ header: s.header, priority: s.priority })),
+    };
   }
 
   estimateTokens(text) {
-    return Math.ceil(text.length / 4);
+    // Conservative estimate: ~4 chars per token for English/code
+    return Math.ceil(text.length / 3.5);
   }
 
   /* ───── Utilities ───── */

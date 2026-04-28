@@ -135,14 +135,18 @@ wss.on('connection', (ws) => {
 // ─── Context Injection ───
 async function buildMemoryContext(taskId, currentTask) {
   const changes = localAgent.fileChanges;
-  const { block, tokens, parts } = await memoryManager.buildContextBlock(
+  const todos = localAgent.todoStore?.todos || [];
+  const { block, tokens, sections } = await memoryManager.buildContextBlock(
     PROJECT_NAME,
     currentTask,
     changes,
-    localAgent.todoStore?.todos?.length || 0,
-    localAgent.progress
+    todos,
+    localAgent.progress,
+    localAgent.knowledgeBase,
+    { maxTokens: 6000 }
   );
-  return { block, tokens, parts };
+  console.log(`[${taskId}] context built: ${tokens}t, sections: [${sections.map((s) => s.header).join(', ')}]`);
+  return { block, tokens, sections };
 }
 
 function injectContext(messages, contextBlock) {
