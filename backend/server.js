@@ -1328,6 +1328,168 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+// ─── Comprehensive System Status ───
+app.get('/api/system-status', async (req, res) => {
+  const checks = {
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    nodeVersion: process.version,
+    env: process.env.NODE_ENV || 'development',
+  };
+
+  // Kimi check
+  const kimiStart = Date.now();
+  try {
+    const kimiRes = await fetch(KIMI_BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.KIMI_CODE_API_KEY || ''}`,
+        'User-Agent': 'KimiCLI/1.5',
+      },
+      body: JSON.stringify({
+        model: KIMI_MODEL,
+        messages: [{ role: 'system', content: 'ping' }, { role: 'user', content: 'pong' }],
+        max_tokens: 5,
+        stream: false,
+      }),
+      timeout: 8000,
+    });
+    checks.kimi = {
+      status: kimiRes.ok ? 'connected' : 'error',
+      httpStatus: kimiRes.status,
+      latencyMs: Date.now() - kimiStart,
+      model: KIMI_MODEL,
+      keyPresent: !!process.env.KIMI_CODE_API_KEY,
+    };
+    if (!kimiRes.ok) {
+      const text = await kimiRes.text().catch(() => '');
+      checks.kimi.error = text.slice(0, 200);
+    }
+  } catch (err) {
+    checks.kimi = { status: 'disconnected', latencyMs: Date.now() - kimiStart, error: err.message, keyPresent: !!process.env.KIMI_CODE_API_KEY };
+  }
+
+  // Claude check
+  const claudeStart = Date.now();
+  try {
+    const claudeRes = await fetch(`${CLAUDE_BASE_URL}/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY || '',
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: 5,
+        messages: [{ role: 'user', content: 'ping' }],
+      }),
+      timeout: 8000,
+    });
+    checks.claude = {
+      status: claudeRes.ok ? 'connected' : 'error',
+      httpStatus: claudeRes.status,
+      latencyMs: Date.now() - claudeStart,
+      model: CLAUDE_MODEL,
+      keyPresent: !!process.env.ANTHROPIC_API_KEY,
+    };
+    if (!claudeRes.ok) {
+      const text = await claudeRes.text().catch(() => '');
+      checks.claude.error = text.slice(0, 200);
+    }
+  } catch (err) {
+    checks.claude = { status: 'disconnected', latencyMs: Date.now() - claudeStart, error: err.message, keyPresent: !!process.env.ANTHROPIC_API_KEY };
+  }
+
+  // Ollama check
+  const ollamaStart = Date.now();
+  try {
+    const ollamaRes = await fetch('http://localhost:11434/api/tags', { timeout: 3000 });
+    if (ollamaRes.ok) {
+      const data = await ollamaRes.json();
+      const models = data.models?.map((m) => m.name) || [];
+      checks.ollama = {
+        status: 'connected',
+        latencyMs: Date.now() - ollamaStart,
+        models,
+        modelCount: models.length,
+      };
+    } else {
+      checks.ollama = { status: 'error', latencyMs: Date.now() - ollamaStart, httpStatus: ollamaRes.status };
+    }
+  } catch (err) {
+    checks.ollama = { status: 'disconnected', latencyMs: Date.now() - ollamaStart, error: err.message };
+  }
+
+  // Local indexer check
+  const indexerStart = Date.now();
+  try {
+    const indexerRes = await fetch('http://localhost:3002/health', { timeout: 3000 });
+    checks.indexer = {
+      status: indexerRes.ok ? 'connected' : 'error',
+      latencyMs: Date.now() - indexerStart,
+      httpStatus: indexerRes.status,
+    };
+  } catch (err) {
+    checks.indexer = { status: 'disconnected', latencyMs: Date.now() - indexerStart, error: err.message };
+  }
+
+  // Roblox MCP check (via indexer)
+  const mcpStart = Date.now();
+  try {
+    const mcpRes = await fetch('http://localhost:3002/index', { timeout: 3000 });
+    if (mcpRes.ok) {
+      const data = await mcpRes.json();
+      checks.mcp = {
+        status: data.scripts?.length > 0 ? 'connected' : 'idle',
+        latencyMs: Date.now() - mcpStart,
+        scriptCount: data.scripts?.length || 0,
+        gameName: data.gameName || 'unknown',
+      };
+    } else {
+      checks.mcp = { status: 'error', latencyMs: Date.now() - mcpStart };
+    }
+  } catch (err) {
+    checks.mcp = { status: 'disconnected', latencyMs: Date.now() - mcpStart, error: err.message };
+  }
+
+  // Backend self-check
+  checks.backend = {
+    status: 'running',
+    port: PORT,
+    project: PROJECT_NAME,
+    webSocketClients: wss.clients.size,
+    sseListeners: Array.from(sseListeners.values()).reduce((sum, set) => sum + set.size, 0),
+    activeAgents: activeAgents.size,
+    memoryDir: path.join(__dirname, 'memory'),
+  };
+
+  // Roblox index (in-memory)
+  checks.robloxIndex = {
+    gameName: robloxIndex.gameName,
+    scriptCount: robloxIndex.scripts.length,
+    indexedAt: robloxIndex.indexedAt,
+    hasIndex: robloxIndex.scripts.length > 0,
+  };
+
+  // Local agent
+  checks.localAgent = localAgent.getStatus();
+
+  // Memory stats
+  checks.memory = {
+    projects: (await memoryManager.listProjects()).length,
+    sessionKeys: memoryManager.sessionMemory.size,
+  };
+
+  // Overall health
+  const allConnected = ['kimi', 'claude', 'ollama'].every((k) => checks[k]?.status === 'connected');
+  const partial = ['kimi', 'claude'].some((k) => checks[k]?.status === 'connected');
+  checks.overall = allConnected ? 'healthy' : partial ? 'degraded' : 'critical';
+
+  res.json(checks);
+});
+
 // ─── Roblox Index Endpoints ───
 
 // Receive index from roblox-indexer service
