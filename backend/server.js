@@ -58,10 +58,19 @@ console.log('Kimi Code API Key loaded:', !!process.env.KIMI_CODE_API_KEY);
 console.log('Anthropic API Key loaded:', !!process.env.ANTHROPIC_API_KEY);
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // Store active agents state
 const activeAgents = new Map();
+
+// Roblox index storage (populated by roblox-indexer service)
+const robloxIndex = {
+  gameName: '',
+  indexedAt: null,
+  scripts: [],
+  hierarchy: null,
+  stats: { total: 0, byCategory: {} },
+};
 
 // SSE listeners: taskId -> Set of response objects
 const sseListeners = new Map();
@@ -133,6 +142,22 @@ wss.on('connection', (ws) => {
 });
 
 // ─── Context Injection ───
+
+function findRelevantRobloxScripts(task, maxResults = 8) {
+  if (!robloxIndex.scripts.length || !task) return [];
+  const taskWords = task.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+  const scored = robloxIndex.scripts.map((s) => {
+    const text = `${s.name} ${s.summary} ${s.category}`.toLowerCase();
+    let score = 0;
+    for (const word of taskWords) {
+      if (text.includes(word)) score += 1;
+    }
+    if (taskWords.some((w) => s.category.toLowerCase().includes(w))) score += 3;
+    return { script: s, score };
+  });
+  return scored.sort((a, b) => b.score - a.score).slice(0, maxResults).filter((s) => s.score > 0).map((s) => s.script);
+}
+
 async function buildMemoryContext(taskId, currentTask) {
   const changes = localAgent.fileChanges;
   const todos = localAgent.todoStore?.todos || [];
@@ -145,8 +170,23 @@ async function buildMemoryContext(taskId, currentTask) {
     localAgent.knowledgeBase,
     { maxTokens: 6000 }
   );
-  console.log(`[${taskId}] context built: ${tokens}t, sections: [${sections.map((s) => s.header).join(', ')}]`);
-  return { block, tokens, sections };
+
+  // Append relevant Roblox scripts if available
+  let finalBlock = block;
+  const relevantScripts = findRelevantRobloxScripts(currentTask);
+  if (relevantScripts.length > 0) {
+    const robloxSection = [
+      '## Roblox Game Scripts (Chisld)',
+      ...relevantScripts.map((s) =>
+        `### \`${s.name}\` (${s.category})\n${s.summary}\n\`\`\`lua\n${s.content?.slice(0, 800) || '[content not cached]'}\n\`\`\``
+      ),
+    ].join('\n\n');
+    finalBlock = block + '\n\n' + robloxSection;
+  }
+
+  const finalTokens = memoryManager.estimateTokens(finalBlock);
+  console.log(`[${taskId}] context built: ${finalTokens}t (${relevantScripts.length} Roblox scripts), sections: [${sections.map((s) => s.header).join(', ')}]`);
+  return { block: finalBlock, tokens: finalTokens, sections };
 }
 
 function injectContext(messages, contextBlock) {
@@ -1282,6 +1322,76 @@ app.get('/api/diag', (req, res) => {
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+// ─── Roblox Index Endpoints ───
+
+// Receive index from roblox-indexer service
+app.post('/api/roblox-index', (req, res) => {
+  const { gameName, scripts, hierarchy, stats, indexedAt } = req.body;
+  if (!scripts || !Array.isArray(scripts)) {
+    return res.status(400).json({ error: 'scripts array required' });
+  }
+
+  robloxIndex.gameName = gameName || 'unknown';
+  robloxIndex.scripts = scripts;
+  robloxIndex.hierarchy = hierarchy || null;
+  robloxIndex.stats = stats || { total: scripts.length, byCategory: {} };
+  robloxIndex.indexedAt = indexedAt || new Date().toISOString();
+
+  console.log(`[RobloxIndex] Received index for ${robloxIndex.gameName}: ${scripts.length} scripts`);
+  broadcast('roblox_index_updated', {
+    gameName: robloxIndex.gameName,
+    scriptCount: scripts.length,
+    indexedAt: robloxIndex.indexedAt,
+  });
+
+  res.json({ message: 'Index received', scripts: scripts.length, game: robloxIndex.gameName });
+});
+
+// Get current Roblox index
+app.get('/api/roblox-index', (req, res) => {
+  res.json(robloxIndex);
+});
+
+// Search Roblox scripts
+app.get('/api/roblox-index/search', (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'q parameter required' });
+  if (robloxIndex.scripts.length === 0) return res.status(404).json({ error: 'No index available' });
+
+  const query = q.toLowerCase();
+  const results = robloxIndex.scripts.filter((s) =>
+    s.name.toLowerCase().includes(query) ||
+    s.summary.toLowerCase().includes(query) ||
+    s.category.toLowerCase().includes(query) ||
+    s.path.toLowerCase().includes(query)
+  );
+
+  res.json({ query: q, count: results.length, results: results.slice(0, 20) });
+});
+
+// Find relevant scripts for a task
+app.get('/api/roblox-index/relevant', (req, res) => {
+  const { task } = req.query;
+  if (!task) return res.status(400).json({ error: 'task parameter required' });
+  if (robloxIndex.scripts.length === 0) return res.status(404).json({ error: 'No index available' });
+
+  // Simple keyword relevance scoring
+  const taskWords = task.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+  const scored = robloxIndex.scripts.map((s) => {
+    const text = `${s.name} ${s.summary} ${s.category}`.toLowerCase();
+    let score = 0;
+    for (const word of taskWords) {
+      if (text.includes(word)) score += 1;
+    }
+    // Boost exact category matches
+    if (taskWords.some((w) => s.category.toLowerCase().includes(w))) score += 3;
+    return { ...s, score };
+  });
+
+  const top = scored.sort((a, b) => b.score - a.score).slice(0, 10);
+  res.json({ task, count: top.length, results: top });
 });
 
 // ─── Server Startup ───

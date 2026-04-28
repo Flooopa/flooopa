@@ -7,7 +7,9 @@ const OLLAMA_URL = 'http://localhost:11434/api/generate';
 const OLLAMA_TAGS = 'http://localhost:11434/api/tags';
 const DEFAULT_MODEL = 'qwen2.5:3b';
 const FALLBACK_MODEL = 'llama3.1:8b';
-const ACCEPTED_MODELS = ['qwen2.5:3b', 'llama3.2:3b', 'llama3.1:8b', 'mistral-nemo:12b'];
+const ACCEPTED_MODELS = ['qwen2.5:3b', 'qwen2.5-coder:7b', 'llama3.2:3b', 'llama3.1:8b', 'mistral-nemo:12b'];
+
+const KNOWLEDGE_BASE_FILE = path.join(__dirname, 'memory', 'knowledge-base.json');
 
 class LocalAgent {
   constructor(projectPath, memoryManager, broadcastFn, todoStore, feedStore) {
@@ -22,9 +24,13 @@ class LocalAgent {
     this.available = false;
     this.model = DEFAULT_MODEL;
     this.watcher = null;
+    this.saveDebounce = null;
   }
 
   async start() {
+    // Load persisted knowledge base first
+    await this.loadKnowledgeBase();
+
     this.available = await this.checkOllama();
     if (!this.available) {
       console.log('[LocalAgent] Ollama not available — local AI features disabled');
@@ -33,6 +39,7 @@ class LocalAgent {
     }
 
     console.log(`[LocalAgent] Using model: ${this.model}`);
+    console.log(`[LocalAgent] Loaded ${this.knowledgeBase.size} file summaries from disk`);
     this.broadcast('local_agent_status', { available: true, model: this.model, message: 'Watching project files' });
 
     this.watcher = chokidar.watch(this.projectPath, {
@@ -50,6 +57,9 @@ class LocalAgent {
 
     // Progress update heartbeat
     setInterval(() => this.updateProgress(), 30 * 1000);
+
+    // Auto-save knowledge base every 60s
+    setInterval(() => this.saveKnowledgeBase(), 60 * 1000);
   }
 
   async checkOllama() {
@@ -69,6 +79,37 @@ class LocalAgent {
       return false;
     } catch {
       return false;
+    }
+  }
+
+  async loadKnowledgeBase() {
+    try {
+      const raw = await fs.readFile(KNOWLEDGE_BASE_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      if (data.summaries) {
+        for (const [file, summary] of Object.entries(data.summaries)) {
+          this.knowledgeBase.set(file, summary);
+        }
+      }
+      if (data.fileChanges) {
+        this.fileChanges = data.fileChanges;
+      }
+    } catch {
+      // File doesn't exist yet — start fresh
+    }
+  }
+
+  async saveKnowledgeBase() {
+    try {
+      const data = {
+        savedAt: new Date().toISOString(),
+        summaries: Object.fromEntries(this.knowledgeBase),
+        fileChanges: this.fileChanges.slice(-100),
+      };
+      await fs.mkdir(path.dirname(KNOWLEDGE_BASE_FILE), { recursive: true });
+      await fs.writeFile(KNOWLEDGE_BASE_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+      console.warn('[LocalAgent] Failed to save knowledge base:', err.message);
     }
   }
 
@@ -98,6 +139,9 @@ class LocalAgent {
           todoCount: this.todoStore?.todos?.length || 0,
           progress: this.progress,
         });
+        // Debounced save
+        if (this.saveDebounce) clearTimeout(this.saveDebounce);
+        this.saveDebounce = setTimeout(() => this.saveKnowledgeBase(), 5000);
       }
     });
 
@@ -151,6 +195,87 @@ File: ${relPath}
 ${snippet}
 \`\`\``;
     return this.ollamaGenerate(prompt, 60);
+  }
+
+  /* ─── Smart Context Selection ─── */
+  async rankFilesByRelevance(task) {
+    if (!this.available || this.knowledgeBase.size === 0) {
+      return Array.from(this.knowledgeBase.entries()).map(([file, summary]) => ({ file, summary, score: 0 }));
+    }
+
+    const entries = Array.from(this.knowledgeBase.entries()).slice(-30); // Limit to last 30 files
+    const entriesText = entries.map(([file, summary], i) => `${i + 1}. ${file}: ${summary}`).join('\n');
+
+    const prompt = `Given this task, rate how relevant each file is (0-10). Return ONLY a JSON array like [{"index":1,"score":8}].
+
+Task: ${task}
+
+Files:
+${entriesText}`;
+
+    const response = await this.ollamaGenerate(prompt, 200);
+    let scores = [];
+    try {
+      const match = response.match(/\[[\s\S]*\]/);
+      if (match) scores = JSON.parse(match[0]);
+    } catch {
+      scores = [];
+    }
+
+    const scoreMap = new Map(scores.map((s) => [s.index - 1, s.score]));
+    return entries.map(([file, summary], i) => ({
+      file,
+      summary,
+      score: scoreMap.get(i) || 0,
+    })).sort((a, b) => b.score - a.score);
+  }
+
+  /* ─── Pre-flight Conflict Detection ─── */
+  async detectConflicts(task, proposedSolution) {
+    if (!this.available || this.knowledgeBase.size === 0) {
+      return { hasConflict: false, details: 'No knowledge base available for conflict check' };
+    }
+
+    // Get top relevant files
+    const ranked = await this.rankFilesByRelevance(task);
+    const relevantFiles = ranked.slice(0, 5).filter((f) => f.score > 3);
+
+    if (relevantFiles.length === 0) {
+      return { hasConflict: false, details: 'No relevant files found for conflict check' };
+    }
+
+    const filesText = relevantFiles.map((f) => `File: ${f.file}\nSummary: ${f.summary}`).join('\n\n');
+
+    const prompt = `You are a code conflict detector. Analyze if the proposed solution conflicts with the existing codebase described below.
+
+EXISTING CODE SUMMARIES:
+${filesText}
+
+PROPOSED TASK:
+${task}
+
+PROPOSED SOLUTION:
+${proposedSolution?.slice(0, 1500) || 'Not yet generated'}
+
+Respond in this exact format:
+CONFLICT: yes/no
+REASON: brief explanation
+FILES_AFFECTED: comma-separated list
+`;
+
+    const response = await this.ollamaGenerate(prompt, 150);
+    const conflictMatch = response.match(/CONFLICT:\s*(yes|no)/i);
+    const reasonMatch = response.match(/REASON:\s*(.+)/i);
+    const filesMatch = response.match(/FILES_AFFECTED:\s*(.+)/i);
+
+    const hasConflict = conflictMatch?.[1]?.toLowerCase() === 'yes';
+
+    return {
+      hasConflict,
+      details: reasonMatch?.[1]?.trim() || 'No details provided',
+      filesAffected: filesMatch?.[1]?.split(',').map((f) => f.trim()).filter(Boolean) || [],
+      raw: response,
+    };
   }
 
   async ollamaGenerate(prompt, maxTokens) {
@@ -228,6 +353,7 @@ ${snippet}
       this.watcher.close();
       this.watcher = null;
     }
+    this.saveKnowledgeBase();
   }
 }
 

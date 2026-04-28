@@ -1,0 +1,17 @@
+{
+  "name": "roblox-indexer",
+  "version": "1.0.0",
+  "description": "Indexes Roblox Studio games via MCP, summarizes scripts with Ollama, and syncs to Railway backend",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "index": "node index.js --once",
+    "dev": "node index.js --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "node-fetch": "^2.7.0"
+  }
+}

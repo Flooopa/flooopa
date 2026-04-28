@@ -1,0 +1,28 @@
+{
+  "gameName": "Chisld",
+  "mcp": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@anthropic-ai/mcp-proxy"],
+    "env": {}
+  },
+  "ollama": {
+    "url": "http://localhost:11434/api/generate",
+    "model": "qwen2.5-coder:7b",
+    "timeout": 30000
+  },
+  "index": {
+    "outputDir": "./indexes",
+    "maxScriptLength": 8000,
+    "categories": ["combat", "networking", "UI", "utility", "data", "animation", "physics", "economy", "social", "admin"]
+  },
+  "railway": {
+    "backendUrl": "https://your-railway-app.up.railway.app",
+    "apiKey": "",
+    "autoSync": true
+  },
+  "server": {
+    "port": 3002,
+    "cors": true
+  }
+}
