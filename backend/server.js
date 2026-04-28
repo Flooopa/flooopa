@@ -11,6 +11,7 @@ const { MemoryManager } = require('./memory');
 const { LocalAgent } = require('./localAgent');
 const { TodoStore } = require('./todoStore');
 const { FeedStore } = require('./feedStore');
+const createContextRoutes = require('./contextRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -1261,6 +1262,9 @@ app.post('/api/feed/:id/react', async (req, res) => {
 app.get('/api/public', (req, res) => {
   res.json(feedStore.getPublicView());
 });
+
+// ─── Context Management Routes ───
+app.use('/api/context', createContextRoutes({ localAgent, memoryManager, robloxIndex }));
 
 // ─── SSE Stream Endpoint ───
 app.get('/api/stream/:taskId', (req, res) => {
