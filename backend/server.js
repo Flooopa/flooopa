@@ -61,6 +61,17 @@ console.log('Anthropic API Key loaded:', !!process.env.ANTHROPIC_API_KEY);
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    const color = res.statusCode >= 500 ? '\x1b[31m' : res.statusCode >= 400 ? '\x1b[33m' : '\x1b[32m';
+    console.log(`${color}${req.method}\x1b[0m ${req.path} \x1b[90m${res.statusCode}\x1b[0m ${duration}ms`);
+  });
+  next();
+});
+
 // Store active agents state
 const activeAgents = new Map();
 
@@ -1327,6 +1338,9 @@ app.get('/api/diag', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
+app.head('/api/health', (req, res) => {
+  res.status(200).end();
+});
 
 // ─── Comprehensive System Status ───
 app.get('/api/system-status', async (req, res) => {
@@ -1618,3 +1632,27 @@ server.listen(PORT, async () => {
   await testModel('claude');
   console.log('Startup tests complete.');
 });
+
+// Graceful shutdown
+function gracefulShutdown(signal) {
+  console.log(`\nReceived ${signal}. Starting graceful shutdown...`);
+  server.close(() => {
+    console.log('HTTP server closed');
+    wss.clients.forEach((client) => {
+      try { client.close(); } catch {}
+    });
+    console.log('WebSocket clients disconnected');
+    localAgent.stop();
+    console.log('Local agent stopped');
+    process.exit(0);
+  });
+
+  // Force exit after 10s
+  setTimeout(() => {
+    console.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
