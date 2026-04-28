@@ -17,7 +17,7 @@
     "categories": ["combat", "networking", "UI", "utility", "data", "animation", "physics", "economy", "social", "admin"]
   },
   "railway": {
-    "backendUrl": "https://your-railway-app.up.railway.app",
+    "backendUrl": "https://flooopa-production.up.railway.app",
     "apiKey": "",
     "autoSync": true
   },
